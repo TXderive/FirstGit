@@ -1,0 +1,627 @@
+--- a/auto_submit.py
++++ b/auto_submit.py
+@@ -2,6 +2,7 @@
+ import json
+ import logging
+ import time
++import uuid
+ from collections import defaultdict
+ from pathlib import Path, PurePosixPath
+ from tempfile import TemporaryDirectory
+@@ -28,6 +29,10 @@
+     excel_base_url,
+     excel_list,
+     msg_base_url, )
++from test_system_third_party.service.dts_api.ticket_preprocess import (
++    check_dts_ticket,
++    extract_dts_numbers,
++)
+ from test_system_third_party.welink import WeLinkMsg
+ 
+ logger = logging.getLogger("django")
+@@ -40,10 +45,13 @@
+ 
+ 
+ class DtsAutoSubmitService:
+-    def __init__(self):
++    def __init__(self, dts_session=None, export_dir=None, ticket_checker=None):
+         self.temp_dir = TemporaryDirectory()
+         self.version_map = self._get_version_pbild_map()
+         self.excel_paths = {}
++        self.dts_session = dts_session
++        self.export_dir = Path(export_dir) if export_dir is not None else None
++        self.ticket_checker = ticket_checker
+ 
+     def __enter__(self):
+         return self
+@@ -72,6 +80,7 @@
+                 "failed": 0,
+                 "blocked": 0,
+                 "history": 0,
++                "pending": 0,
+             }
+         )
+ 
+@@ -84,12 +93,21 @@
+ 
+         for item in precheck["history_hits"]:
+             self._add_version_count(stats, item, "history")
++
++        tickets = precheck.get("ticket_preprocess", {})
++        pending_versions = defaultdict(set)
++        for item in tickets.get("intercepted", []):
++            for target in item["targets"]:
++                pending_versions[target["qg_version"]].update(item["pending_dts_nos"])
++        for version, numbers in pending_versions.items():
++            stats[version]["pending"] = len(numbers)
+ 
+         table = PrettyTable()
+         table.field_names = [
+             "AOS版本",
+             "走单成功",
+             "走单失败",
++            "待走单",
+             "预检查失败",
+             "历史已走单",
+         ]
+@@ -101,6 +119,7 @@
+                 version,
+                 data["success"],
+                 data["failed"],
++                data["pending"],
+                 data["blocked"],
+                 data["history"],
+             ])
+@@ -109,6 +128,7 @@
+             "TOTAL",
+             sum(x["success"] for x in stats.values()),
+             sum(x["failed"] for x in stats.values()),
++            sum(x["pending"] for x in stats.values()),
+             sum(x["blocked"] for x in stats.values()),
+             sum(x["history"] for x in stats.values()),
+         ])
+@@ -122,9 +142,21 @@
+             f"本次共提交 {len(results)} 单，成功 {success} 单，"
+             f"失败 {failed} 单，预检查失败 {len(precheck['blocked'])} 单。"
+         )
++        numbers = tickets.get("pending_dts_nos", [])
++        pending_text = ", ".join(numbers[:50])
++        if len(numbers) > 50:
++            pending_text += "，其余见导出清单"
++        ticket_text = (
++            f"待走单 {len(numbers)} 单，待核对 {len(tickets.get('failure_rows', []))} 条。\n"
++        )
++        if pending_text:
++            ticket_text += f"待走单 DTS：{pending_text}\n"
++        if precheck.get("ticket_export_file"):
++            ticket_text += f"导出清单：{precheck['ticket_export_file']}\n"
+         return (
+-            "【dts定时走单】成功！\n"
++            "【dts定时走单】处理结果\n"
+             f"{summary_text}\n\n"
++            f"{ticket_text}\n"
+             f"{table}\n\n"
+         )
+ 
+@@ -200,12 +232,35 @@
+             }},
+         )
+ 
++    @staticmethod
++    def _preserve_uncached_dts_formulas(pending, excel_file, column):
++        """公式没有缓存值时，保留为待核对异常，不将其误认为空白单号。"""
++        pending["DTS单号"] = pending["DTS单号"].fillna("").astype(str)
++        pending["_dts_input_error"] = ""
++        blank = pending.loc[pending["DTS单号"].str.strip() == ""]
++        if blank.empty:
++            return
++        indexes = {int(row["_source_row"]): index for index, row in blank.iterrows()}
++        workbook = load_workbook(excel_file, read_only=True, data_only=False)
++        try:
++            rows = workbook["Sheet1"].iter_rows(
++                min_row=min(indexes), max_row=max(indexes), min_col=column, max_col=column,
++            )
++            for row_number, cells in enumerate(rows, start=min(indexes)):
++                if row_number in indexes and cells[0].data_type == "f":
++                    index = indexes[row_number]
++                    pending.at[index, "DTS单号"] = cells[0].value
++                    pending.at[index, "_dts_input_error"] = "DTS单号公式没有缓存值，请计算并保存或转换为文本"
++        finally:
++            workbook.close()
++
+     def _read_pending(self, excel_file, qg_version, baseline_statuses=None):
+         """先筛选 Sheet1 待走单项，再核对评审总表并取得证明文件名。"""
+         keys = ["HWPSIRT ID", "CVE ID"]
+ 
+         with pd.ExcelFile(excel_file) as workbook:
+             data = pd.read_excel(workbook, sheet_name="Sheet1")
++            data["_source_row"] = range(2, len(data) + 2)
+             for col in keys:
+                 data[col] = data[col].fillna("").astype(str).str.strip()
+ 
+@@ -232,6 +287,11 @@
+             if pending.empty:
+                 pending["proof_name"] = ""
+                 return pending
++            if "DTS单号" not in pending.columns:
++                raise ValueError(f"{Path(excel_file).name} 的 Sheet1 缺少 DTS单号 列")
++            self._preserve_uncached_dts_formulas(
++                pending, excel_file, int(data.columns.get_loc("DTS单号")) + 1,
++            )
+ 
+             review = pd.read_excel(workbook, sheet_name="评审总表")[
+                 keys + ["原始CVSS评分"]
+@@ -280,6 +340,8 @@
+         result = []
+         for _, row in df.iterrows():
+             qg = self._cell(row, "qg_version")
++            dts_value = self._cell(row, "DTS单号")
++            dts_error = self._cell(row, "_dts_input_error")
+             result.append({
+                 "hwpsirt_id": self._cell(row, "HWPSIRT ID"),
+                 "cve_id": self._cell(row, "CVE ID"),
+@@ -287,6 +349,10 @@
+                 "pbild": self.version_map.get(qg, ""),
+                 "proof_name": self._cell(row, "proof_name"),
+                 "proof_file": "",
++                "dts_value": dts_value,
++                "dts_nos": [] if dts_error else extract_dts_numbers(dts_value),
++                "dts_error": dts_error,
++                "excel_row": int(row["_source_row"]) if "_source_row" in row else None,
+             })
+         return result
+ 
+@@ -386,6 +452,149 @@
+                 pending.append(item)
+         return pending, blocked
+ 
++    @staticmethod
++    def _ticket_export_row(number, targets, status, events=(), reason=""):
++        return {
++            "DTS单号": number,
++            "状态": status,
++            "AOS版本": ";".join(sorted({item["qg_version"] for item in targets})),
++            "HWPSIRT ID": ";".join(sorted({item["hwpsirt_id"] for item in targets})),
++            "CVE ID": ";".join(sorted({item["cve_id"] for item in targets})),
++            "来源行": ";".join(sorted({
++                f"{item['qg_version']}:{item.get('excel_row', '')}" for item in targets
++            })),
++            "事件名称": ";".join(events),
++            "原因": reason,
++        }
++
++    def _split_ticket_preprocess(self, items):
++        """仅查询原候选；命中项待走单，查询异常项待核对，二者均不自动提交。"""
++        pending, intercepted, blocked = [], [], []
++        cache, matches, failures, invalid = {}, {}, {}, []
++        checker = getattr(self, "ticket_checker", None)
++        session = getattr(self, "dts_session", None)
++
++        for item in items:
++            if item["group_error"]:
++                pending.append(item)
++                continue
++            by_number, invalid_targets = {}, []
++            for target in item["targets"]:
++                if target.get("dts_value") and not target.get("dts_nos"):
++                    invalid_targets.append(target)
++                for number in target.get("dts_nos", []):
++                    by_number.setdefault(number, []).append(target)
++
++            hit_numbers, errors = [], []
++            for number, targets in by_number.items():
++                if number not in cache:
++                    try:
++                        if checker is not None:
++                            checked = checker(number)
++                        elif session is not None:
++                            checked = check_dts_ticket(number, session=session)
++                        else:
++                            checked = {
++                                "query_success": False, "error": "未配置 DTS 已登录 Session",
++                            }
++                        if not isinstance(checked, dict):
++                            raise ValueError("invalid checker result")
++                        if checked.get("query_success") is True and (
++                            not isinstance(checked.get("matched"), bool)
++                            or not isinstance(checked.get("event_names"), list)
++                            or any(not isinstance(name, str) for name in checked["event_names"])
++                        ):
++                            raise ValueError("invalid checker result")
++                    except Exception as error:
++                        checked = {
++                            "query_success": False,
++                            "error": f"DTS 查询方法异常: {type(error).__name__}",
++                        }
++                    cache[number] = checked
++                checked = cache[number]
++                if checked.get("query_success") is not True:
++                    reason = checked.get("error") or "DTS 查询未成功"
++                    errors.append(f"{number} 待核对: {reason}")
++                    record = failures.setdefault(number, {"targets": [], "error": str(reason)})
++                    record["targets"].extend(targets)
++                elif checked["matched"]:
++                    hit_numbers.append(number)
++                    record = matches.setdefault(number, {
++                        "targets": [], "event_names": checked["event_names"],
++                    })
++                    record["targets"].extend(targets)
++
++            for target in invalid_targets:
++                reason = target.get("dts_error") or "DTS单号 单元格未包含有效单号"
++                invalid.append(self._ticket_export_row(
++                    target["dts_value"], [target], "待核对", reason=reason,
++                ))
++                errors.append(reason)
++            if hit_numbers:
++                item["pending_dts_nos"] = sorted(hit_numbers)
++                item["ticket_status"] = "待走单"
++                intercepted.append(item)
++                logger.info(
++                    "[DTS预处理拦截] pbild=%s hwpsirt=%s dts=%s 状态=待走单",
++                    item["pbild"], item["hwpsirt_id"], ",".join(sorted(hit_numbers)),
++                )
++            elif errors:
++                item["errors"] = errors
++                blocked.append(item)
++            else:
++                pending.append(item)
++
++        export_pending = [
++            self._ticket_export_row(
++                number, data["targets"], "待走单", events=data["event_names"],
++                reason="命中预处理规则，未自动提交",
++            )
++            for number, data in sorted(matches.items())
++        ]
++        export_failures = [
++            self._ticket_export_row(number, data["targets"], "待核对", reason=data["error"])
++            for number, data in sorted(failures.items())
++        ] + invalid
++        return pending, {
++            "intercepted": intercepted,
++            "blocked": blocked,
++            "pending_rows": export_pending,
++            "failure_rows": export_failures,
++            "pending_dts_nos": sorted(matches),
++            "checked_count": len(cache),
++        }
++
++    def _export_ticket_preprocess(self, ticket_result):
++        if not ticket_result["pending_rows"] and not ticket_result["failure_rows"]:
++            return ""
++        directory = getattr(self, "export_dir", None) or Path.cwd() / "dts_reports"
++        directory = Path(directory)
++        directory.mkdir(parents=True, exist_ok=True)
++        path = directory / (
++            f"dts_pending_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.xlsx"
++        )
++        columns = ["DTS单号", "状态", "AOS版本", "HWPSIRT ID", "CVE ID", "来源行", "事件名称", "原因"]
++        with pd.ExcelWriter(path, engine="openpyxl") as writer:
++            pd.DataFrame(ticket_result["pending_rows"], columns=columns).to_excel(
++                writer, sheet_name="待走单", index=False,
++            )
++            pd.DataFrame(ticket_result["failure_rows"], columns=columns).to_excel(
++                writer, sheet_name="待核对", index=False,
++            )
++            # 导出全部作为文本保存，源单元格和接口文本不作为公式执行。
++            for sheet in writer.book.worksheets:
++                sheet.freeze_panes = "A2"
++                sheet.auto_filter.ref = sheet.dimensions
++                for column, width in zip("ABCDEFGH", (22, 12, 40, 24, 24, 45, 65, 65)):
++                    sheet.column_dimensions[column].width = width
++                for row in sheet.iter_rows():
++                    for cell in row:
++                        if isinstance(cell.value, str):
++                            cell.data_type = "s"
++        logger.info("[DTS清单导出] file=%s pending=%s failed=%s", path,
++                    len(ticket_result["pending_rows"]), len(ticket_result["failure_rows"]))
++        return str(path.resolve())
++
+     def _split_history(self, items):
+         """成功历史阻止再次提交；使用本轮目标补写尚未同步的 Excel。"""
+         pending, history_hits = [], []
+@@ -491,6 +700,8 @@
+                 grouped, baseline_statuses,
+             )
+             logger.info("共用基线核对失败: %s", len(baseline_blocked))
++            grouped, ticket_result = self._split_ticket_preprocess(grouped)
++            ticket_export_file = self._export_ticket_preprocess(ticket_result)
+             pending, history_hits = self._split_history(grouped)
+ 
+             self._log_step(4, "检查证明文件")
+@@ -504,7 +715,7 @@
+ 
+         self._log_step(5, "走单前预检查")
+         ready, blocked = self._precheck(pending)
+-        blocked = baseline_blocked + blocked
++        blocked = baseline_blocked + ticket_result["blocked"] + blocked
+ 
+         logger.info("可走单: %s", len(ready))
+         logger.info("预检查失败: %s", len(blocked))
+@@ -528,6 +739,8 @@
+             "missing_files": missing_names,
+             "excel_failed": excel_failed,
+             "token": token,
++            "ticket_preprocess": ticket_result,
++            "ticket_export_file": ticket_export_file,
+         }
+ 
+     @staticmethod
+@@ -797,7 +1010,9 @@
+         return {"updated": updated_total, "failed": failed}
+ 
+     def send_summary(self, summary, report):
+-        if not summary["total"] and not summary["history_hits"]:
++        if not any(summary.get(key) for key in (
++            "total", "history_hits", "pending_dts", "dts_check_failed",
++        )):
+             return
+ 
+         try:
+@@ -816,6 +1031,8 @@
+                 ("success", "成功"),
+                 ("failed", "失败"),
+                 ("history_hits", "历史成功补回"),
++                ("pending_dts", "待走单"),
++                ("dts_check_failed", "DTS待核对"),
+                 ("blocked", "预检查失败"),
+                 ("missing_files", "缺证明文件"),
+                 ("excel_updated", "Excel回写"),
+@@ -849,6 +1066,10 @@
+             "excel_updated": excel["updated"],
+             "excel_failed": excel["failed"],
+             "duration": int(time.time() - start),
++            "pending_dts": len(precheck["ticket_preprocess"]["pending_dts_nos"]),
++            "pending_dts_nos": precheck["ticket_preprocess"]["pending_dts_nos"],
++            "dts_check_failed": len(precheck["ticket_preprocess"]["failure_rows"]),
++            "ticket_export_file": precheck["ticket_export_file"],
+         }
+ 
+         report = self._build_result_report(
+--- /dev/null
++++ b/ticket_preprocess.py
+@@ -0,0 +1,236 @@
++"""从基线 Excel 收集 DTS 单号，按 getTicket 返回的可操作事件筛选。"""
++
++import re
++import time
++from http.cookies import SimpleCookie
++from pathlib import Path
++
++import pandas as pd
++import requests
++from requests.structures import CaseInsensitiveDict
++
++
++GET_TICKET_URL = "https://codeartsx.rnd.yinwang.com/DTSPortal/v1/getTicket"
++TARGET_EVENT_NAMES = frozenset({
++    "提交开发人员定位",
++    "转发测试(项目)经理审核",
++})
++DTS_NO_PATTERN = re.compile(r"(?<![A-Za-z0-9_])DTS[0-9]+(?![A-Za-z0-9_])", re.IGNORECASE)
++
++
++def extract_dts_numbers(value):
++    """从单元格提取单号并去重，保持首次出现的顺序。"""
++    return list(dict.fromkeys(number.upper() for number in DTS_NO_PATTERN.findall(str(value))))
++
++
++def get_dts_session(headers):
++    """从本地配置构造带 cftk、AJAX 标识和可更新 CookieJar 的 Session。"""
++    provided = CaseInsensitiveDict(headers)
++    raw_cookie = provided.pop("Cookie", "")
++    if not isinstance(raw_cookie, str) or not raw_cookie.strip():
++        raise ValueError("headers 中需要填写本地最新的 Cookie")
++    cookies = SimpleCookie()
++    cookies.load(raw_cookie)
++    if not cookies:
++        raise ValueError("Cookie 解析为空，请只填写 Cookie 请求头的值")
++    cftk = provided.get("cftk")
++    if not cftk and "prod_cftk" in cookies:
++        cftk = cookies["prod_cftk"].value
++    if not cftk:
++        raise ValueError("缺少同一次 getTicket 请求的 prod_cftk Cookie 或 cftk 请求头")
++    for name in ("Host", "Connection", "Content-Length", "Accept-Encoding"):
++        provided.pop(name, None)
++    session = requests.Session()
++    session.headers.update({
++        "Accept": "application/json, text/plain, */*",
++        "Content-Type": "application/json; charset=UTF-8",
++        "X-Requested-With": "XMLHttpRequest",
++        "X-Language": "zh-CN",
++        "Referer": "https://codeartsx.rnd.yinwang.com/DTSPortal/",
++    })
++    session.headers.update(provided)
++    session.headers["cftk"] = cftk
++    session.headers["Accept-Encoding"] = "gzip, deflate"
++    for name, morsel in cookies.items():
++        session.cookies.set(
++            name, morsel.value, domain="codeartsx.rnd.yinwang.com", path="/", secure=True,
++        )
++    return session
++
++
++class DtsTicketQueryError(Exception):
++    """DTS 请求失败或返回的业务结构无法判定。"""
++
++
++def matches_target_events(payload):
++    """rejectFlow 必须恰好包含两个目标事件，各一次，顺序不限。"""
++    if not isinstance(payload, dict) or not isinstance(payload.get("result"), dict):
++        raise DtsTicketQueryError("响应缺少有效的 result 对象")
++    flows = payload["result"].get("rejectFlow")
++    if not isinstance(flows, list):
++        raise DtsTicketQueryError("响应缺少有效的 result.rejectFlow 列表")
++
++    names = []
++    for index, flow in enumerate(flows):
++        if not isinstance(flow, dict) or not isinstance(flow.get("eventName"), str):
++            raise DtsTicketQueryError(f"rejectFlow[{index}] 缺少有效的 eventName")
++        name = flow["eventName"].strip()
++        if not name:
++            raise DtsTicketQueryError(f"rejectFlow[{index}].eventName 为空")
++        names.append(name)
++    return len(names) == 2 and frozenset(names) == TARGET_EVENT_NAMES
++
++
++def read_excel_dts_numbers(excel_file):
++    """扫描 Sheet1 的 DTS单号 列；空白跳过，多单号拆分，并保留无效行位置。"""
++    data = pd.read_excel(
++        excel_file, sheet_name="Sheet1", dtype=str, keep_default_na=False,
++    )
++    data.columns = [str(column).strip() for column in data.columns]
++    if "DTS单号" not in data.columns:
++        raise ValueError(f"{Path(excel_file).name} 的 Sheet1 缺少 DTS单号 列")
++
++    numbers, seen, invalid_cells = [], set(), []
++    empty_cells = 0
++    for row_number, value in enumerate(data["DTS单号"], start=2):
++        text = str(value).strip()
++        if not text:
++            empty_cells += 1
++            continue
++        matches = extract_dts_numbers(text)
++        if not matches:
++            invalid_cells.append({"row": row_number, "value": text})
++            continue
++        for number in matches:
++            number = number.upper()
++            if number not in seen:
++                seen.add(number)
++                numbers.append(number)
++    return {
++        "dts_nos": numbers,
++        "empty_cells": empty_cells,
++        "invalid_cells": invalid_cells,
++    }
++
++
++class DtsTicketPreprocessor:
++    """顺序查询单号并汇总；认证通过调用方现有的 Session 或 headers 复用。"""
++
++    def __init__(self, session=None, headers=None, timeout=(5, 30), endpoint=GET_TICKET_URL):
++        cookie_headers = session is None and headers and CaseInsensitiveDict(headers).get("Cookie")
++        if cookie_headers:
++            self.session = get_dts_session(headers)
++            self.headers = {}
++        else:
++            self.session = session if session is not None else requests.Session()
++            self.headers = dict(headers) if headers is not None else {}
++        self.timeout = timeout
++        self.endpoint = endpoint
++        self._owns_session = session is None
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *_):
++        if self._owns_session:
++            self.session.close()
++
++    def fetch_ticket(self, dts_no):
++        try:
++            with self.session.get(
++                self.endpoint,
++                params={"dtsNo": dts_no, "_": int(time.time() * 1000)},
++                headers=self.headers,
++                timeout=self.timeout,
++                allow_redirects=False,
++            ) as response:
++                if not 200 <= response.status_code < 300:
++                    raise DtsTicketQueryError(f"getTicket 返回 HTTP {response.status_code}")
++                try:
++                    return response.json()
++                except ValueError as error:
++                    raise DtsTicketQueryError("getTicket 响应不是有效 JSON，请检查登录态") from error
++        except requests.RequestException as error:
++            # 不把认证头、Cookie 或完整响应写入错误列表。
++            raise DtsTicketQueryError(f"getTicket 请求失败: {type(error).__name__}") from error
++
++    def check(self, dts_no):
++        number = str(dts_no).strip().upper()
++        result = {
++            "dts_no": number, "query_success": False, "matched": False,
++            "event_names": [], "error": "",
++        }
++        if DTS_NO_PATTERN.fullmatch(number) is None:
++            result["error"] = "无效的 DTS 单号"
++            return result
++        try:
++            payload = self.fetch_ticket(number)
++            result["matched"] = matches_target_events(payload)
++            result["event_names"] = [
++                item["eventName"].strip() for item in payload["result"]["rejectFlow"]
++            ]
++            result["query_success"] = True
++        except DtsTicketQueryError as error:
++            result["error"] = str(error)
++        return result
++
++    def run(self, dts_nos):
++        if isinstance(dts_nos, str):
++            dts_nos = [dts_nos]
++        numbers, seen = [], set()
++        for value in dts_nos:
++            number = str(value).strip().upper() if value is not None else ""
++            if number and number not in seen:
++                numbers.append(number)
++                seen.add(number)
++
++        matched, unmatched, failures = [], [], []
++        for number in numbers:
++            result = self.check(number)
++            if not result["query_success"]:
++                failures.append({"dts_no": number, "error": result["error"]})
++                continue
++            (matched if result["matched"] else unmatched).append(number)
++
++        return {
++            "total": len(numbers),
++            "matched_count": len(matched),
++            "matched_dts_nos": matched,
++            "unmatched_count": len(unmatched),
++            "unmatched_dts_nos": unmatched,
++            "failed_count": len(failures),
++            "failures": failures,
++        }
++
++    def run_excel(self, excel_file):
++        source = read_excel_dts_numbers(excel_file)
++        summary = self.run(source["dts_nos"])
++        summary.update({
++            "source_file": str(excel_file),
++            "empty_cells": source["empty_cells"],
++            "invalid_cells": source["invalid_cells"],
++        })
++        return summary
++
++    def run_excels(self, excel_files):
++        """合并多个已下载的 Excel，跨文件的同一单号只查询一次。"""
++        if isinstance(excel_files, (str, Path)):
++            excel_files = [excel_files]
++        numbers, sources = [], []
++        for excel_file in excel_files:
++            source = read_excel_dts_numbers(excel_file)
++            numbers.extend(source["dts_nos"])
++            sources.append({
++                "source_file": str(excel_file),
++                "empty_cells": source["empty_cells"],
++                "invalid_cells": source["invalid_cells"],
++            })
++        summary = self.run(numbers)
++        summary["sources"] = sources
++        return summary
++
++
++def check_dts_ticket(dts_no, headers=None, session=None, timeout=(5, 30)):
++    """与已在本地验证的单号查询方法保持相同的调用和返回结构。"""
++    with DtsTicketPreprocessor(session=session, headers=headers, timeout=timeout) as processor:
++        return processor.check(dts_no)
+--- /dev/null
++++ b/requirements-preprocess.txt
+@@ -0,0 +1,4 @@
++requests>=2.32.4,<3
++pandas>=1.5,<4
++openpyxl>=3.1,<4
++prettytable>=3,<4

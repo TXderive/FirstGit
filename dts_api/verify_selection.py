@@ -6,6 +6,8 @@ import shutil
 import tempfile
 import time
 import unittest
+import uuid
+from collections import defaultdict
 from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path, PurePosixPath
@@ -14,6 +16,9 @@ from unittest.mock import Mock, patch
 
 import pandas as pd
 from openpyxl import load_workbook
+from prettytable import PrettyTable
+
+from ticket_preprocess import check_dts_ticket, extract_dts_numbers
 
 
 SOURCE = Path(__file__).with_name("auto_submit.py")
@@ -28,6 +33,9 @@ methods = {
     "_get_proof_files", "precheck", "submit_all", "_download",
     "_history_key", "_get_history", "_save_history", "_set_excel_synced",
     "_writeback_targets", "_update_excel", "update_excel_submit_status", "run_auto_submit",
+    "_ticket_export_row", "_split_ticket_preprocess", "_export_ticket_preprocess",
+    "_preserve_uncached_dts_formulas",
+    "_build_result_report", "_add_version_count", "send_summary",
 }
 service.body = [node for node in service.body if getattr(node, "name", "") in methods]
 constants = [
@@ -43,6 +51,8 @@ logger.propagate = False
 scope = {
     "pd": pd, "logger": logger, "Path": Path, "PurePosixPath": PurePosixPath,
     "time": time, "load_workbook": load_workbook,
+    "uuid": uuid, "defaultdict": defaultdict, "PrettyTable": PrettyTable,
+    "check_dts_ticket": check_dts_ticket, "extract_dts_numbers": extract_dts_numbers,
 }
 exec(compile(ast.fix_missing_locations(module), str(SOURCE), "exec"), scope)
 SelectionService = scope["DtsAutoSubmitService"]
@@ -56,6 +66,7 @@ def candidate(hwpsirt="H1", cve="CVE-2026-1001", **overrides):
         "最新状态": "无影响",
         "已走单": "",
         "是否评审": "是",
+        "DTS单号": "",
     }
     row.update(overrides)
     return row
@@ -114,6 +125,7 @@ class SelectionTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.path = Path(self.directory.name) / "version-a.xlsx"
         self.service = SelectionService()
+        self.service.export_dir = Path(self.directory.name) / "reports"
         self.history = MemoryHistory()
         self.service._history = Mock(return_value=self.history)
         self.service.version_map = {
@@ -567,12 +579,14 @@ class SelectionTests(unittest.TestCase):
             "msg_base_url": "/minutes", "SHARED_BASELINE_GROUPS": (),
         }
 
-    def simulated_task(self, ftp, day):
+    def simulated_task(self, ftp, day, ticket_checker=None):
         task = SelectionService()
         task.version_map = dict(self.service.version_map)
         local = Path(self.directory.name) / day
         local.mkdir()
         task.temp_dir = SimpleNamespace(name=str(local))
+        task.export_dir = Path(self.directory.name) / "reports"
+        task.ticket_checker = ticket_checker
         task._history = Mock(return_value=self.history)
         task._get_token = Mock(return_value="test-token")
         task.build_submit_data = Mock(return_value={})
@@ -632,6 +646,218 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(result, {"updated": 1, "failed": 0})
         self.assertEqual(ftp.uploads, 2)
         self.assertEqual(pd.read_excel(self.path, sheet_name="Sheet1")["已走单"].tolist(), ["是"])
+
+    @staticmethod
+    def ticket_result(number, matched=False, error=""):
+        return {
+            "dts_no": number, "query_success": not bool(error), "matched": matched,
+            "event_names": ["提交开发人员定位", "转发测试(项目)经理审核"] if matched else [],
+            "error": error,
+        }
+
+    def test_matched_ticket_is_exported_pending_without_submission(self):
+        self.workbook([candidate(**{"DTS单号": "DTS0001"})], [review()])
+        self.service.ticket_checker = Mock(return_value=self.ticket_result("DTS0001", matched=True))
+        result = self.run_precheck(("version-a",), shared_groups=())
+        self.assertEqual(result["ready"], [])
+        self.assertEqual(result["blocked"], [])
+        self.assertEqual(result["history_hits"], [])
+        self.service._get_token.assert_not_called()
+        self.assertEqual(self.service.submit_all(result), [])
+        self.service.submit_workflow.assert_not_called()
+        exported = pd.read_excel(result["ticket_export_file"], sheet_name="待走单")
+        self.assertEqual(exported["DTS单号"].tolist(), ["DTS0001"])
+        self.assertEqual(exported["状态"].tolist(), ["待走单"])
+        self.assertEqual(exported["来源行"].tolist(), ["version-a:2"])
+        self.assertEqual(pd.read_excel(self.path, sheet_name="Sheet1")["已走单"].fillna("").tolist(), [""])
+
+    def test_ticket_checks_only_cover_original_filtered_candidates(self):
+        self.workbook([
+            candidate(**{"DTS单号": "DTS0001"}),
+            candidate("H2", **{"最新状态": "有影响", "DTS单号": "DTS0002"}),
+            candidate("H3", **{"已走单": "是", "DTS单号": "DTS0003"}),
+            candidate("H4", **{"是否评审": "否", "DTS单号": "DTS0004"}),
+            candidate("H5", **{"DTS单号": "DTS0005"}),
+        ], [review(), review("H2"), review("H3"), review("H4")])
+        self.service.ticket_checker = Mock(return_value=self.ticket_result("DTS0001", matched=True))
+        result = self.run_precheck(("version-a",), shared_groups=())
+        self.service.ticket_checker.assert_called_once_with("DTS0001")
+        self.assertEqual(result["ticket_preprocess"]["pending_dts_nos"], ["DTS0001"])
+
+    def test_unmatched_ticket_continues_original_submit_and_writeback(self):
+        self.workbook([candidate(**{"DTS单号": "DTS0001"})], [review()])
+        (Path(self.directory.name) / "proof.msg").write_text("test minutes")
+        checker = Mock(return_value=self.ticket_result("DTS0001"))
+        task, summary = self.simulated_task(LocalFtp(self.directory.name), "day1", checker)
+        task.submit_workflow.assert_called_once()
+        self.assertEqual(summary["success"], 1)
+        self.assertEqual(summary["pending_dts"], 0)
+        self.assertEqual(summary["ticket_export_file"], "")
+        self.assertEqual(pd.read_excel(self.path, sheet_name="Sheet1")["已走单"].tolist(), ["是"])
+
+    def test_mixed_batch_only_submits_unmatched_group(self):
+        self.workbook([
+            candidate("H1", **{"DTS单号": "DTS0001"}),
+            candidate("H2", **{"DTS单号": "DTS0002"}),
+            candidate("H3", **{"DTS单号": "DTS0003"}),
+        ], [review("H1"), review("H2"), review("H3")])
+        (Path(self.directory.name) / "proof.msg").write_text("test minutes")
+        replies = {
+            "DTS0001": self.ticket_result("DTS0001", matched=True),
+            "DTS0002": self.ticket_result("DTS0002"),
+            "DTS0003": self.ticket_result("DTS0003", error="test timeout"),
+        }
+        checker = Mock(side_effect=replies.__getitem__)
+        task, summary = self.simulated_task(LocalFtp(self.directory.name), "day1", checker)
+        self.assertEqual(checker.call_count, 3)
+        task.submit_workflow.assert_called_once()
+        self.assertEqual(task.submit_workflow.call_args.args[0]["hwpsirt_id"], "H2")
+        self.assertEqual(summary["total"], 1)
+        self.assertEqual(summary["pending_dts_nos"], ["DTS0001"])
+        self.assertEqual(summary["dts_check_failed"], 1)
+        self.assertEqual(set(self.history.records), {("P1", "H2")})
+        self.assertEqual(pd.read_excel(self.path, sheet_name="Sheet1")["已走单"].fillna("").tolist(), ["", "是", ""])
+        self.assertEqual(pd.read_excel(summary["ticket_export_file"], sheet_name="待走单")["DTS单号"].tolist(), ["DTS0001"])
+        self.assertEqual(pd.read_excel(summary["ticket_export_file"], sheet_name="待核对")["DTS单号"].tolist(), ["DTS0003"])
+
+    def test_pending_ticket_does_not_become_history_repair(self):
+        self.workbook([candidate(**{"DTS单号": "DTS0001"})], [review()])
+        record = self.successful_history()
+        ftp = LocalFtp(self.directory.name)
+        checker = Mock(return_value=self.ticket_result("DTS0001", matched=True))
+        task, summary = self.simulated_task(ftp, "day1", checker)
+        self.assertEqual(summary["history_hits"], 0)
+        self.assertEqual(summary["pending_dts"], 1)
+        task.submit_workflow.assert_not_called()
+        task._save_history.assert_not_called()
+        self.assertEqual(ftp.uploads, 0)
+        self.assertFalse(record["excel_synced"])
+        shutil.rmtree(task.temp_dir.name)
+        self.assertTrue(Path(summary["ticket_export_file"]).is_file())
+        self.assertEqual(pd.read_excel(self.path, sheet_name="Sheet1")["已走单"].fillna("").tolist(), [""])
+
+    def test_missing_dts_session_blocks_candidates_without_live_query(self):
+        self.workbook([candidate(**{"DTS单号": "DTS0001"})], [review()])
+        query = Mock(side_effect=AssertionError("must not send unauthenticated requests"))
+        with patch.dict(scope, {"check_dts_ticket": query}):
+            result = self.run_precheck(("version-a",), shared_groups=())
+        query.assert_not_called()
+        self.assertEqual(result["ready"], [])
+        self.assertEqual(len(result["blocked"]), 1)
+        self.assertIn("未配置", result["blocked"][0]["errors"][0])
+        self.assertEqual(result["ticket_preprocess"]["pending_dts_nos"], [])
+        self.service._get_token.assert_not_called()
+
+    def test_query_failure_exports_pending_review_and_does_not_submit(self):
+        self.workbook([candidate(**{"DTS单号": "DTS0001"})], [review()])
+        self.service.ticket_checker = Mock(return_value=self.ticket_result("DTS0001", error="test timeout"))
+        result = self.run_precheck(("version-a",), shared_groups=())
+        self.assertEqual(result["ready"], [])
+        exported = pd.read_excel(result["ticket_export_file"], sheet_name="待核对")
+        self.assertEqual(exported["状态"].tolist(), ["待核对"])
+        self.assertEqual(exported["原因"].tolist(), ["test timeout"])
+        self.service._get_token.assert_not_called()
+
+    def test_repeated_ticket_across_baselines_is_checked_and_exported_once(self):
+        self.shared_workbooks([
+            candidate(**{"DTS单号": "DTS0001"}), candidate(**{"DTS单号": "DTS0001"}),
+        ], [candidate(**{"DTS单号": "DTS0001"})])
+        self.service.ticket_checker = Mock(return_value=self.ticket_result("DTS0001", matched=True))
+        result = self.run_precheck()
+        self.service.ticket_checker.assert_called_once_with("DTS0001")
+        exported = pd.read_excel(result["ticket_export_file"], sheet_name="待走单")
+        self.assertEqual(exported["DTS单号"].tolist(), ["DTS0001"])
+        self.assertEqual(exported["AOS版本"].tolist(), [";".join(SHARED_VERSIONS)])
+
+    def test_same_group_can_export_a_match_and_an_independent_query_failure(self):
+        self.workbook([candidate(**{"DTS单号": "DTS0001，DTS0002"})], [review()])
+        replies = {
+            "DTS0001": self.ticket_result("DTS0001", matched=True),
+            "DTS0002": self.ticket_result("DTS0002", error="test timeout"),
+        }
+        self.service.ticket_checker = Mock(side_effect=replies.__getitem__)
+        result = self.run_precheck(("version-a",), shared_groups=())
+        self.assertEqual(result["ready"], [])
+        self.assertEqual(result["ticket_preprocess"]["pending_dts_nos"], ["DTS0001"])
+        self.assertEqual(len(result["ticket_preprocess"]["failure_rows"]), 1)
+        self.service._get_token.assert_not_called()
+
+    def test_invalid_dts_cell_is_exported_as_literal_text_for_review(self):
+        value = '=HYPERLINK("https://example.invalid", "test")'
+        self.workbook([candidate(**{"DTS单号": value})], [review()])
+        self.service.ticket_checker = Mock()
+        result = self.run_precheck(("version-a",), shared_groups=())
+        self.service.ticket_checker.assert_not_called()
+        self.assertEqual(result["ready"], [])
+        wb = load_workbook(result["ticket_export_file"])
+        try:
+            self.assertEqual(wb["待核对"]["A2"].value, value)
+            self.assertEqual(wb["待核对"]["A2"].data_type, "s")
+        finally:
+            wb.close()
+
+    def test_missing_dts_column_cannot_silently_bypass_preprocessing(self):
+        with pd.ExcelWriter(self.path, engine="openpyxl") as writer:
+            pd.DataFrame([candidate()]).drop(columns=["DTS单号"]).to_excel(writer, sheet_name="Sheet1", index=False)
+        with self.assertRaisesRegex(ValueError, "缺少 DTS单号"):
+            self.run_precheck(("version-a",), shared_groups=())
+        self.service._get_token.assert_not_called()
+
+    def test_uncached_formula_is_not_queried_or_treated_as_an_empty_ticket(self):
+        formula = '=HYPERLINK("https://example.invalid/DTS0001", "DTS0001")'
+        self.workbook([candidate(**{"DTS单号": formula})], [review()])
+        self.service.ticket_checker = Mock()
+        result = self.run_precheck(("version-a",), shared_groups=())
+        self.service.ticket_checker.assert_not_called()
+        self.assertEqual(result["ready"], [])
+        self.assertIn("没有缓存值", result["ticket_preprocess"]["failure_rows"][0]["原因"])
+        self.service._get_token.assert_not_called()
+
+    def test_invalid_checker_response_fails_closed(self):
+        self.workbook([candidate(**{"DTS单号": "DTS0001"})], [review()])
+        self.service.ticket_checker = Mock(return_value={"query_success": True, "matched": "yes"})
+        result = self.run_precheck(("version-a",), shared_groups=())
+        self.assertEqual(result["ready"], [])
+        self.assertEqual(result["ticket_preprocess"]["pending_dts_nos"], [])
+        self.assertEqual(len(result["ticket_preprocess"]["failure_rows"]), 1)
+
+    def test_report_displays_pending_ticket_and_export_path(self):
+        self.workbook([candidate(**{"DTS单号": "DTS0001"})], [review()])
+        self.service.ticket_checker = Mock(return_value=self.ticket_result("DTS0001", matched=True))
+        precheck = self.run_precheck(("version-a",), shared_groups=())
+        report = self.service._build_result_report(precheck, [], {"updated": 0, "failed": 0})
+        self.assertIn("待走单 1 单", report)
+        self.assertIn("DTS0001", report)
+        self.assertIn(precheck["ticket_export_file"], report)
+        self.assertIn("共提交 0 单", report)
+        self.assertNotIn("成功！", report)
+
+    def test_pending_only_summary_still_sends_existing_notification(self):
+        send = Mock()
+        models = SimpleNamespace(objects=SimpleNamespace(get=Mock(return_value=SimpleNamespace(token="test-only"))))
+        with patch.dict(scope, {
+            "WeLinkToken": models, "WeLinkMsg": SimpleNamespace(send_msg=send),
+            "WELINK_NOTICE_NO4": "test-room",
+        }):
+            self.service.send_summary({"total": 0, "history_hits": 0, "pending_dts": 1}, "待走单 DTS0001")
+        send.assert_called_once_with("test-only", "test-room", "待走单 DTS0001")
+
+    def test_export_failure_stops_before_submit_token_is_acquired(self):
+        self.workbook([candidate(**{"DTS单号": "DTS0001"})], [review()])
+        self.service.ticket_checker = Mock(return_value=self.ticket_result("DTS0001", matched=True))
+        self.service.export_dir.write_text("not a directory")
+        with self.assertRaises(FileExistsError):
+            self.run_precheck(("version-a",), shared_groups=())
+        self.service._get_token.assert_not_called()
+        self.service.submit_workflow.assert_not_called()
+
+    def test_original_cross_baseline_veto_remains_before_ticket_queries(self):
+        self.shared_workbooks([candidate(**{"DTS单号": "DTS0001"})], [candidate(**{"最新状态": "待确认"})])
+        self.service.ticket_checker = Mock()
+        result = self.run_precheck()
+        self.service.ticket_checker.assert_not_called()
+        self.assert_shared_submission_blocked(result, "非无影响状态")
+        self.assertEqual(result["ticket_export_file"], "")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,21 @@
 # auto_submit.py 更新补丁
 
+## 预处理拦截与待走单导出集成版
+
+[dts-preprocess.patch](dts-preprocess.patch) 基于提交 `b80d5a5` 中的 `dts_api/auto_submit.py`。
+它更新走单流程，并新增 `ticket_preprocess.py` 和 `requirements-preprocess.txt`。
+在原项目 `auto_submit.py` 所在目录执行：
+
+```bash
+git apply --check dts-preprocess.patch
+git apply dts-preprocess.patch
+python -m pip install -r requirements-preprocess.txt
+```
+
+随后在现有定时任务入口注入已登录 Session 和导出目录，调用示例见 [预处理集成说明](../dts_api/TICKET_PREPROCESS.md)。
+
+## 之前的历史去重补丁
+
 按当前代码版本选择一份补丁应用：
 
 | 补丁 | 适用基线 | 内容 |
@@ -7,8 +23,8 @@
 | [auto_submit.patch](auto_submit.patch) | 本次对话最初提供的原始 `auto_submit.py` | Sheet1 优先筛选、评审记录核对、多基线双向检查，以及历史去重和 Excel 补写修复 |
 | [auto_submit-history.patch](auto_submit-history.patch) | 本分支提交 `44b0d215c6a069dd1df4d4fee6588d0ea751697f` 中的 `dts_api/auto_submit.py` | 本次历史去重和 Excel 补写修复 |
 
-两份补丁都将对应基线更新为本分支当前的 `dts_api/auto_submit.py`，只需选择一份。
-本分支的完整源码已包含这些修改；补丁用于更新你自己项目中的对应文件。
+这两份历史补丁分别将对应基线更新为提交 `b80d5a5` 中的 `dts_api/auto_submit.py`，只需选择一份。
+当前分支源码在此基础上继续包含预处理集成；这些补丁用于按版本更新你自己的项目。
 
 ## 应用方法
 
