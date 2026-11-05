@@ -387,9 +387,28 @@ class DtsAutoSubmitService:
         return pending, blocked
 
     def _split_history(self, items):
-        """关闭 MongoDB 历史成功记录筛选，不再跳过历史单据。"""
-        logger.info("[历史检查] 已关闭历史成功筛选，本次不跳过历史记录")
-        return items, []
+        """成功历史阻止再次提交；使用本轮目标补写尚未同步的 Excel。"""
+        pending, history_hits = [], []
+        for item in items:
+            history = self._get_history(item)
+            if history is None:
+                pending.append(item)
+                continue
+
+            # 即使历史标记已同步，本轮仍筛出未走单行时也要补写；不复用旧 targets。
+            result = {
+                **item,
+                "status": "already_submitted",
+                "dts_nos": history.get("dts_nos", []),
+                "error": "",
+            }
+            history_hits.append(result)
+            logger.info(
+                "[历史已走单] hwpsirt=%s pbild=%s dts=%s 仅补写Excel，不再提交",
+                item["hwpsirt_id"], item["pbild"],
+                ",".join(result["dts_nos"]),
+            )
+        return pending, history_hits
 
     def _get_proof_files(self, ftp, items):
         cache, missing = {}, []
@@ -672,41 +691,44 @@ class DtsAutoSubmitService:
     @staticmethod
     def _update_excel(local_file, items):
         wb = load_workbook(local_file)
-        ws = wb["Sheet1"]
-        headers = {
-            str(c.value).strip(): c.column
-            for c in ws[1] if c.value is not None
-        }
-        for col in ("HWPSIRT ID", "CVE ID", "已走单"):
-            if col not in headers:
-                raise ValueError(f"{Path(local_file).name}缺少列: {col}")
+        try:
+            ws = wb["Sheet1"]
+            headers = {
+                str(c.value).strip(): c.column
+                for c in ws[1] if c.value is not None
+            }
+            for col in ("HWPSIRT ID", "CVE ID", "已走单"):
+                if col not in headers:
+                    raise ValueError(f"{Path(local_file).name}缺少列: {col}")
 
-        row_map = {}
-        for row in range(2, ws.max_row + 1):
-            hwpsirt = str(
-                ws.cell(row, headers["HWPSIRT ID"]).value or ""
-            ).strip()
-            cve = str(ws.cell(row, headers["CVE ID"]).value or "").strip()
-            row_map[(hwpsirt, cve)] = row
+            row_map = {}
+            for row in range(2, ws.max_row + 1):
+                hwpsirt = str(
+                    ws.cell(row, headers["HWPSIRT ID"]).value or ""
+                ).strip()
+                cve = str(ws.cell(row, headers["CVE ID"]).value or "").strip()
+                row_map.setdefault((hwpsirt, cve), []).append(row)
 
-        missing = [
-            x for x in items
-            if (x["hwpsirt_id"], x["cve_id"]) not in row_map
-        ]
-        if missing:
-            return 0, missing
+            missing = [
+                x for x in items
+                if (x["hwpsirt_id"], x["cve_id"]) not in row_map
+            ]
+            if missing:
+                return 0, missing
 
-        updated = 0
-        for item in items:
-            row = row_map[(item["hwpsirt_id"], item["cve_id"])]
-            cell = ws.cell(row, headers["已走单"])
-            if str(cell.value or "").strip() != "是":
-                cell.value = "是"
-                updated += 1
+            updated = 0
+            for item in items:
+                for row in row_map[(item["hwpsirt_id"], item["cve_id"])]:
+                    cell = ws.cell(row, headers["已走单"])
+                    if str(cell.value or "").strip() != "是":
+                        cell.value = "是"
+                        updated += 1
 
-        if updated:
-            wb.save(local_file)
-        return updated, []
+            if updated:
+                wb.save(local_file)
+            return updated, []
+        finally:
+            wb.close()
 
     def update_excel_submit_status(self, results):
         targets = self._writeback_targets(results)
@@ -730,12 +752,12 @@ class DtsAutoSubmitService:
                     file_status[qg] = False
                     continue
 
-                local = self.excel_paths.get(qg)
                 remote = str(PurePosixPath(excel_base_url) / file_name)
-                if not local:
-                    local = self._download(ftp, remote, self.temp_dir.name)
-
                 try:
+                    # 基于 FTP 最新内容补写，避免使用上次上传失败后已改过的本地副本。
+                    local = self._download(ftp, remote, self.temp_dir.name)
+                    if not local:
+                        raise RuntimeError("FTP下载失败")
                     updated, missing = self._update_excel(local, items)
                     if missing:
                         raise RuntimeError(f"未找到{len(missing)}条数据")

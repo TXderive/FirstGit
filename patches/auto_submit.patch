@@ -1,0 +1,353 @@
+--- a/auto_submit.py
++++ b/auto_submit.py
+@@ -32,6 +32,11 @@
+ 
+ logger = logging.getLogger("django")
+ HISTORY_COL = "dts_auto_submit_history"
++# 自动按 excel_list 中各版本的 pbild 分组；这里可补充显式关联组。
++# 每组可含任意多个版本（不带 .xlsx），组内双向检查，重叠组会合并。
++SHARED_BASELINE_GROUPS = (
++    ("aos5.0-master-1951", "aos5.0-master-1952"),
++)
+ 
+ 
+ class DtsAutoSubmitService:
+@@ -195,20 +200,48 @@
+             }},
+         )
+ 
+-    def _read_pending(self, excel_file, qg_version):
+-        sheets = pd.read_excel(
+-            excel_file,
+-            sheet_name=["Sheet1", "评审总表"],
+-        )
+-        data = sheets["Sheet1"]
+-        review = sheets["评审总表"][
+-            ["HWPSIRT ID", "CVE ID", "原始CVSS评分"]
+-        ].copy()
++    def _read_pending(self, excel_file, qg_version, baseline_statuses=None):
++        """先筛选 Sheet1 待走单项，再核对评审总表并取得证明文件名。"""
+         keys = ["HWPSIRT ID", "CVE ID"]
+ 
+-        for df in (data, review):
++        with pd.ExcelFile(excel_file) as workbook:
++            data = pd.read_excel(workbook, sheet_name="Sheet1")
+             for col in keys:
+-                df[col] = df[col].fillna("").astype(str).str.strip()
++                data[col] = data[col].fillna("").astype(str).str.strip()
++
++            status = data["最新状态"].fillna("").astype(str).str.strip()
++            # 在筛选前保留完整状态：其他状态、已走单或未评审的记录也参与核对。
++            if baseline_statuses is not None:
++                baseline_statuses[qg_version] = {}
++                for hwpsirt, value in zip(data["HWPSIRT ID"], status):
++                    if hwpsirt:
++                        baseline_statuses[qg_version].setdefault(
++                            hwpsirt, set(),
++                        ).add(value)
++
++            submitted = data["已走单"].fillna("").astype(str).str.strip()
++            pending = data.loc[
++                (status == "无影响") & (submitted == "")
++            ].copy()
++            pending["qg_version"] = qg_version
++            logger.info(
++                "[Sheet1初筛] qg=%s total=%s pending=%s",
++                qg_version, len(data), len(pending),
++            )
++
++            if pending.empty:
++                pending["proof_name"] = ""
++                return pending
++
++            review = pd.read_excel(workbook, sheet_name="评审总表")[
++                keys + ["原始CVSS评分"]
++            ].copy()
++
++        for col in keys:
++            review[col] = review[col].fillna("").astype(str).str.strip()
++
++        # 空 ID 不能作为二次核对的匹配依据。
++        review = review.loc[review[keys].ne("").all(axis=1)].copy()
+ 
+         review["原始CVSS评分"] = (
+             review["原始CVSS评分"].fillna("").astype(str).str.strip()
+@@ -218,17 +251,29 @@
+             inplace=True,
+         )
+ 
+-        result = review.merge(data, on=keys, how="inner")
+-        status = result["最新状态"].fillna("").astype(str).str.strip()
++        # 以 Sheet1 候选为主表；证明文件名只取自评审总表。
++        result = pending.drop(columns=["proof_name"], errors="ignore").merge(
++            review,
++            on=keys,
++            how="left",
++            indicator="_review_match",
++        )
++        matched = result["_review_match"] == "both"
++        for _, row in result.loc[~matched].iterrows():
++            logger.warning(
++                "[评审核对失败] qg=%s hwpsirt=%s cve=%s "
++                "reason=评审总表无有效的双ID匹配记录",
++                qg_version, row["HWPSIRT ID"], row["CVE ID"],
++            )
++
++        # 保留原有的 Sheet1“是否评审=是”限制。
+         reviewed = result["是否评审"].fillna("").astype(str).str.strip()
+-        submitted = result["已走单"].fillna("").astype(str).str.strip()
+-
+-        result = result[
+-            (status == "无影响")
+-            & (reviewed == "是")
+-            & (submitted == "")
+-            ].copy()
+-        result["qg_version"] = qg_version
++        result = result.loc[matched & (reviewed == "是")].copy()
++        result.drop(columns=["_review_match"], inplace=True)
++        logger.info(
++            "[评审总表核对] qg=%s candidates=%s matched_and_reviewed=%s",
++            qg_version, len(pending), len(result),
++        )
+         return result
+ 
+     def _build_items(self, df):
+@@ -269,10 +314,101 @@
+                 logger.info("[走单去重] hwpsirt=%s pbild=%s versions=%s", item["hwpsirt_id"], item["pbild"], ",".join(versions))
+         return list(groups.values())
+ 
++    def _get_shared_baseline_groups(self):
++        """合并相同 pbild 和显式配置的关联关系，得到互相核对的版本组。"""
++        by_pbild = {}
++        for file_name in excel_list:
++            version = Path(file_name).stem
++            pbild = self.version_map.get(version, "")
++            if pbild:
++                by_pbild.setdefault(pbild, set()).add(version)
++
++        groups = [set(group) for group in SHARED_BASELINE_GROUPS]
++        groups.extend(versions for versions in by_pbild.values() if len(versions) > 1)
++        merged = []
++        for group in groups:
++            component, separate = set(group), []
++            for existing in merged:
++                if component.intersection(existing):
++                    component.update(existing)
++                else:
++                    separate.append(existing)
++            merged = separate + [component]
++        return tuple(tuple(sorted(group)) for group in merged if len(group) > 1)
++
++    def _split_shared_baselines(self, items, baseline_statuses):
++        """共用 DTS 单据在每个基线都明确为无影响，才允许继续走单。"""
++        groups = self._get_shared_baseline_groups()
++        pending, blocked = [], []
++        for item in items:
++            versions = {x["qg_version"] for x in item["targets"]}
++            conflicts, missing, unread = {}, set(), set()
++            for group in groups:
++                if not versions.intersection(group):
++                    continue
++                for version in group:
++                    if version not in baseline_statuses:
++                        unread.add(version)
++                        continue
++                    # DTS 接口按 pbild + HWPSIRT ID 提交，CVE 不拆成独立单据。
++                    statuses = baseline_statuses[version].get(
++                        item["hwpsirt_id"], set(),
++                    )
++                    if not statuses:
++                        missing.add(version)
++                    elif statuses != {"无影响"}:
++                        conflicts[version] = statuses
++
++            reasons = []
++            if conflicts:
++                reasons.append(
++                    "共用DTS单据存在非无影响状态: " + ";".join(
++                        f"{version}={','.join(value or '空白' for value in sorted(statuses))}"
++                        for version, statuses in sorted(conflicts.items())
++                    )
++                )
++            if missing:
++                reasons.append(
++                    "共用DTS基线缺少对应HWPSIRT记录，无法确认无影响: "
++                    + ",".join(sorted(missing))
++                )
++            if unread:
++                reasons.append(
++                    "共用DTS基线未成功读取，无法核对影响状态: "
++                    + ",".join(sorted(unread))
++                )
++            if reasons:
++                item["errors"] = (
++                    [item["group_error"]] if item["group_error"] else []
++                ) + reasons
++                blocked.append(item)
++            else:
++                pending.append(item)
++        return pending, blocked
++
+     def _split_history(self, items):
+-        """关闭 MongoDB 历史成功记录筛选，不再跳过历史单据。"""
+-        logger.info("[历史检查] 已关闭历史成功筛选，本次不跳过历史记录")
+-        return items, []
++        """成功历史阻止再次提交；使用本轮目标补写尚未同步的 Excel。"""
++        pending, history_hits = [], []
++        for item in items:
++            history = self._get_history(item)
++            if history is None:
++                pending.append(item)
++                continue
++
++            # 即使历史标记已同步，本轮仍筛出未走单行时也要补写；不复用旧 targets。
++            result = {
++                **item,
++                "status": "already_submitted",
++                "dts_nos": history.get("dts_nos", []),
++                "error": "",
++            }
++            history_hits.append(result)
++            logger.info(
++                "[历史已走单] hwpsirt=%s pbild=%s dts=%s 仅补写Excel，不再提交",
++                item["hwpsirt_id"], item["pbild"],
++                ",".join(result["dts_nos"]),
++            )
++        return pending, history_hits
+ 
+     def _get_proof_files(self, ftp, items):
+         cache, missing = {}, []
+@@ -328,6 +464,7 @@
+ 
+     def precheck(self):
+         items, excel_failed = [], []
++        baseline_statuses = {}
+         self.excel_paths = {}
+         self._log_step(2, "获取并筛选基线Excel")
+ 
+@@ -341,13 +478,19 @@
+ 
+                 qg = Path(file_name).stem
+                 self.excel_paths[qg] = excel
+-                items.extend(self._build_items(self._read_pending(excel, qg)))
++                items.extend(self._build_items(
++                    self._read_pending(excel, qg, baseline_statuses)
++                ))
+ 
+             logger.info("Excel总数: %s", len(excel_list))
+             logger.info("Excel下载失败: %s", len(excel_failed))
+             logger.info("筛选待走单: %s", len(items))
+ 
+             grouped = self._deduplicate(items)
++            grouped, baseline_blocked = self._split_shared_baselines(
++                grouped, baseline_statuses,
++            )
++            logger.info("共用基线核对失败: %s", len(baseline_blocked))
+             pending, history_hits = self._split_history(grouped)
+ 
+             self._log_step(4, "检查证明文件")
+@@ -361,6 +504,7 @@
+ 
+         self._log_step(5, "走单前预检查")
+         ready, blocked = self._precheck(pending)
++        blocked = baseline_blocked + blocked
+ 
+         logger.info("可走单: %s", len(ready))
+         logger.info("预检查失败: %s", len(blocked))
+@@ -547,41 +691,44 @@
+     @staticmethod
+     def _update_excel(local_file, items):
+         wb = load_workbook(local_file)
+-        ws = wb["Sheet1"]
+-        headers = {
+-            str(c.value).strip(): c.column
+-            for c in ws[1] if c.value is not None
+-        }
+-        for col in ("HWPSIRT ID", "CVE ID", "已走单"):
+-            if col not in headers:
+-                raise ValueError(f"{Path(local_file).name}缺少列: {col}")
+-
+-        row_map = {}
+-        for row in range(2, ws.max_row + 1):
+-            hwpsirt = str(
+-                ws.cell(row, headers["HWPSIRT ID"]).value or ""
+-            ).strip()
+-            cve = str(ws.cell(row, headers["CVE ID"]).value or "").strip()
+-            row_map[(hwpsirt, cve)] = row
+-
+-        missing = [
+-            x for x in items
+-            if (x["hwpsirt_id"], x["cve_id"]) not in row_map
+-        ]
+-        if missing:
+-            return 0, missing
+-
+-        updated = 0
+-        for item in items:
+-            row = row_map[(item["hwpsirt_id"], item["cve_id"])]
+-            cell = ws.cell(row, headers["已走单"])
+-            if str(cell.value or "").strip() != "是":
+-                cell.value = "是"
+-                updated += 1
+-
+-        if updated:
+-            wb.save(local_file)
+-        return updated, []
++        try:
++            ws = wb["Sheet1"]
++            headers = {
++                str(c.value).strip(): c.column
++                for c in ws[1] if c.value is not None
++            }
++            for col in ("HWPSIRT ID", "CVE ID", "已走单"):
++                if col not in headers:
++                    raise ValueError(f"{Path(local_file).name}缺少列: {col}")
++
++            row_map = {}
++            for row in range(2, ws.max_row + 1):
++                hwpsirt = str(
++                    ws.cell(row, headers["HWPSIRT ID"]).value or ""
++                ).strip()
++                cve = str(ws.cell(row, headers["CVE ID"]).value or "").strip()
++                row_map.setdefault((hwpsirt, cve), []).append(row)
++
++            missing = [
++                x for x in items
++                if (x["hwpsirt_id"], x["cve_id"]) not in row_map
++            ]
++            if missing:
++                return 0, missing
++
++            updated = 0
++            for item in items:
++                for row in row_map[(item["hwpsirt_id"], item["cve_id"])]:
++                    cell = ws.cell(row, headers["已走单"])
++                    if str(cell.value or "").strip() != "是":
++                        cell.value = "是"
++                        updated += 1
++
++            if updated:
++                wb.save(local_file)
++            return updated, []
++        finally:
++            wb.close()
+ 
+     def update_excel_submit_status(self, results):
+         targets = self._writeback_targets(results)
+@@ -605,12 +752,12 @@
+                     file_status[qg] = False
+                     continue
+ 
+-                local = self.excel_paths.get(qg)
+                 remote = str(PurePosixPath(excel_base_url) / file_name)
+-                if not local:
++                try:
++                    # 基于 FTP 最新内容补写，避免使用上次上传失败后已改过的本地副本。
+                     local = self._download(ftp, remote, self.temp_dir.name)
+-
+-                try:
++                    if not local:
++                        raise RuntimeError("FTP下载失败")
+                     updated, missing = self._update_excel(local, items)
+                     if missing:
+                         raise RuntimeError(f"未找到{len(missing)}条数据")
