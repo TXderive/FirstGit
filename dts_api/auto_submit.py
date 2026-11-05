@@ -32,6 +32,10 @@ from test_system_third_party.welink import WeLinkMsg
 
 logger = logging.getLogger("django")
 HISTORY_COL = "dts_auto_submit_history"
+# 以下基线共用 DTS 单据，必须全部明确为无影响才能提交。
+SHARED_BASELINE_GROUPS = (
+    ("aos5.0-master-1951", "aos5.0-master-1952"),
+)
 
 
 class DtsAutoSubmitService:
@@ -195,7 +199,7 @@ class DtsAutoSubmitService:
             }},
         )
 
-    def _read_pending(self, excel_file, qg_version):
+    def _read_pending(self, excel_file, qg_version, baseline_statuses=None):
         """先筛选 Sheet1 待走单项，再核对评审总表并取得证明文件名。"""
         keys = ["HWPSIRT ID", "CVE ID"]
 
@@ -205,6 +209,15 @@ class DtsAutoSubmitService:
                 data[col] = data[col].fillna("").astype(str).str.strip()
 
             status = data["最新状态"].fillna("").astype(str).str.strip()
+            # 在筛选前保留完整状态：其他状态、已走单或未评审的记录也参与核对。
+            if baseline_statuses is not None:
+                baseline_statuses[qg_version] = {}
+                for hwpsirt, value in zip(data["HWPSIRT ID"], status):
+                    if hwpsirt:
+                        baseline_statuses[qg_version].setdefault(
+                            hwpsirt, set(),
+                        ).add(value)
+
             submitted = data["已走单"].fillna("").astype(str).str.strip()
             pending = data.loc[
                 (status == "无影响") & (submitted == "")
@@ -300,6 +313,56 @@ class DtsAutoSubmitService:
                 logger.info("[走单去重] hwpsirt=%s pbild=%s versions=%s", item["hwpsirt_id"], item["pbild"], ",".join(versions))
         return list(groups.values())
 
+    @staticmethod
+    def _split_shared_baselines(items, baseline_statuses):
+        """共用 DTS 单据在每个基线都明确为无影响，才允许继续走单。"""
+        pending, blocked = [], []
+        for item in items:
+            versions = {x["qg_version"] for x in item["targets"]}
+            conflicts, missing, unread = {}, set(), set()
+            for group in SHARED_BASELINE_GROUPS:
+                if not versions.intersection(group):
+                    continue
+                for version in group:
+                    if version not in baseline_statuses:
+                        unread.add(version)
+                        continue
+                    # DTS 接口按 pbild + HWPSIRT ID 提交，CVE 不拆成独立单据。
+                    statuses = baseline_statuses[version].get(
+                        item["hwpsirt_id"], set(),
+                    )
+                    if not statuses:
+                        missing.add(version)
+                    elif statuses != {"无影响"}:
+                        conflicts[version] = statuses
+
+            reasons = []
+            if conflicts:
+                reasons.append(
+                    "共用DTS单据存在非无影响状态: " + ";".join(
+                        f"{version}={','.join(value or '空白' for value in sorted(statuses))}"
+                        for version, statuses in sorted(conflicts.items())
+                    )
+                )
+            if missing:
+                reasons.append(
+                    "共用DTS基线缺少对应HWPSIRT记录，无法确认无影响: "
+                    + ",".join(sorted(missing))
+                )
+            if unread:
+                reasons.append(
+                    "共用DTS基线未成功读取，无法核对影响状态: "
+                    + ",".join(sorted(unread))
+                )
+            if reasons:
+                item["errors"] = (
+                    [item["group_error"]] if item["group_error"] else []
+                ) + reasons
+                blocked.append(item)
+            else:
+                pending.append(item)
+        return pending, blocked
+
     def _split_history(self, items):
         """关闭 MongoDB 历史成功记录筛选，不再跳过历史单据。"""
         logger.info("[历史检查] 已关闭历史成功筛选，本次不跳过历史记录")
@@ -359,6 +422,7 @@ class DtsAutoSubmitService:
 
     def precheck(self):
         items, excel_failed = [], []
+        baseline_statuses = {}
         self.excel_paths = {}
         self._log_step(2, "获取并筛选基线Excel")
 
@@ -372,13 +436,19 @@ class DtsAutoSubmitService:
 
                 qg = Path(file_name).stem
                 self.excel_paths[qg] = excel
-                items.extend(self._build_items(self._read_pending(excel, qg)))
+                items.extend(self._build_items(
+                    self._read_pending(excel, qg, baseline_statuses)
+                ))
 
             logger.info("Excel总数: %s", len(excel_list))
             logger.info("Excel下载失败: %s", len(excel_failed))
             logger.info("筛选待走单: %s", len(items))
 
             grouped = self._deduplicate(items)
+            grouped, baseline_blocked = self._split_shared_baselines(
+                grouped, baseline_statuses,
+            )
+            logger.info("共用基线核对失败: %s", len(baseline_blocked))
             pending, history_hits = self._split_history(grouped)
 
             self._log_step(4, "检查证明文件")
@@ -392,6 +462,7 @@ class DtsAutoSubmitService:
 
         self._log_step(5, "走单前预检查")
         ready, blocked = self._precheck(pending)
+        blocked = baseline_blocked + blocked
 
         logger.info("可走单: %s", len(ready))
         logger.info("预检查失败: %s", len(blocked))
