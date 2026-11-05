@@ -20,7 +20,7 @@ service = next(
 )
 methods = {
     "_read_pending", "_cell", "_build_items", "_deduplicate", "_precheck",
-    "_split_shared_baselines", "_log_step", "_split_history",
+    "_get_shared_baseline_groups", "_split_shared_baselines", "_log_step", "_split_history",
     "_get_proof_files", "precheck", "submit_all",
 }
 service.body = [node for node in service.body if getattr(node, "name", "") in methods]
@@ -184,7 +184,7 @@ class SelectionTests(unittest.TestCase):
         )
         (Path(self.directory.name) / "proof.msg").write_text("test meeting minutes")
 
-    def run_precheck(self, versions=SHARED_VERSIONS):
+    def run_precheck(self, versions=SHARED_VERSIONS, shared_groups=None):
         self.service.temp_dir = SimpleNamespace(name=self.directory.name)
 
         def download(ftp, remote, local_dir):
@@ -195,20 +195,24 @@ class SelectionTests(unittest.TestCase):
         self.service._get_token = Mock(return_value="test-token")
         self.service.upload_proof = Mock()
         self.service.submit_workflow = Mock()
-        with patch.dict(scope, {
+        settings = {
             "FtpMgr": SimpleNamespace(
                 get_ias_ftp_client=lambda: nullcontext(object()),
             ),
             "excel_list": [f"{version}.xlsx" for version in versions],
             "excel_base_url": "/baselines",
             "msg_base_url": "/minutes",
-        }):
+        }
+        if shared_groups is not None:
+            settings["SHARED_BASELINE_GROUPS"] = shared_groups
+        with patch.dict(scope, settings):
             return self.service.precheck()
 
-    def assert_shared_submission_blocked(self, result, reason):
+    def assert_shared_submission_blocked(self, result, reason, count=1):
         self.assertEqual(result["ready"], [])
-        self.assertEqual(len(result["blocked"]), 1)
-        self.assertIn(reason, ";".join(result["blocked"][0]["errors"]))
+        self.assertEqual(len(result["blocked"]), count)
+        for item in result["blocked"]:
+            self.assertIn(reason, ";".join(item["errors"]))
         self.service._get_token.assert_not_called()
         self.assertFalse(any(
             PurePosixPath(call.args[1]).name == "proof.msg"
@@ -307,6 +311,123 @@ class SelectionTests(unittest.TestCase):
         result = self.run_precheck()
         self.assertEqual(len(result["ready"]), 1)
         self.assertEqual(result["blocked"], [])
+
+    def baseline_workbooks(self, groups_by_pbild, overrides=None):
+        overrides = overrides or {}
+        versions = []
+        for pbild, group in groups_by_pbild.items():
+            for version in group:
+                versions.append(version)
+                self.service.version_map[version] = pbild
+                self.workbook(
+                    [candidate(**overrides.get(version, {}))], [review()],
+                    path=Path(self.directory.name) / f"{version}.xlsx",
+                )
+        (Path(self.directory.name) / "proof.msg").write_text("test meeting minutes")
+        return tuple(versions)
+
+    def test_automatic_three_file_group_is_mutual_from_every_member(self):
+        versions = ("baseline-a", "baseline-b", "baseline-c")
+        for changed in versions:
+            with self.subTest(non_unaffected=changed):
+                self.baseline_workbooks(
+                    {"P5": versions}, {changed: {"最新状态": "待确认"}},
+                )
+                result = self.run_precheck(versions, shared_groups=())
+                self.assert_shared_submission_blocked(result, f"{changed}=待确认")
+
+    def test_automatic_three_file_group_all_unaffected_can_proceed(self):
+        versions = self.baseline_workbooks({"P5": ("baseline-a", "baseline-b", "baseline-c")})
+        result = self.run_precheck(versions, shared_groups=())
+        self.assertEqual(result["blocked"], [])
+        self.assertEqual(len(result["ready"]), 1)
+        self.assertEqual(
+            {target["qg_version"] for target in result["ready"][0]["targets"]},
+            set(versions),
+        )
+
+    def test_automatic_groups_are_independent_for_the_same_hwpsirt(self):
+        versions = self.baseline_workbooks(
+            {"P5": ("baseline-a", "baseline-b", "baseline-c"),
+             "P6": ("baseline-d", "baseline-e")},
+            {"baseline-c": {"最新状态": "待确认"}},
+        )
+        result = self.run_precheck(versions, shared_groups=())
+        self.assertEqual(len(result["blocked"]), 1)
+        self.assertEqual(result["blocked"][0]["pbild"], "P5")
+        self.assertEqual(len(result["ready"]), 1)
+        self.assertEqual(result["ready"][0]["pbild"], "P6")
+        self.assertEqual(
+            {target["qg_version"] for target in result["ready"][0]["targets"]},
+            {"baseline-d", "baseline-e"},
+        )
+
+    def test_missing_download_does_not_remove_an_automatic_group_member(self):
+        versions = self.baseline_workbooks({"P5": ("baseline-a", "baseline-b", "baseline-c")})
+        (Path(self.directory.name) / "baseline-c.xlsx").unlink()
+        result = self.run_precheck(versions, shared_groups=())
+        self.assert_shared_submission_blocked(result, "基线未成功读取")
+        self.assertEqual(result["excel_failed"], ["baseline-c.xlsx"])
+
+    def test_unconfigured_version_map_entries_are_not_automatic_dependencies(self):
+        versions = self.baseline_workbooks({"P5": ("baseline-a", "baseline-b")})
+        self.service.version_map["not-in-excel-list"] = "P5"
+        result = self.run_precheck(versions, shared_groups=())
+        self.assertEqual(result["blocked"], [])
+        self.assertEqual(len(result["ready"]), 1)
+
+    def test_explicit_three_file_group_is_mutual_from_every_member(self):
+        groups_by_pbild = {"PA": ("baseline-a",), "PB": ("baseline-b",), "PC": ("baseline-c",)}
+        versions = ("baseline-a", "baseline-b", "baseline-c")
+        for changed in versions:
+            with self.subTest(non_unaffected=changed):
+                self.baseline_workbooks(
+                    groups_by_pbild, {changed: {"最新状态": "待确认"}},
+                )
+                result = self.run_precheck(versions, shared_groups=(versions,))
+                self.assert_shared_submission_blocked(result, f"{changed}=待确认", count=2)
+
+    def test_multiple_explicit_groups_are_independent(self):
+        versions = self.baseline_workbooks(
+            {"PA": ("baseline-a",), "PB": ("baseline-b",), "PC": ("baseline-c",),
+             "PD": ("baseline-d",), "PE": ("baseline-e",)},
+            {"baseline-c": {"最新状态": "待确认"}},
+        )
+        result = self.run_precheck(versions, shared_groups=(versions[:3], versions[3:]))
+        self.assertEqual(len(result["blocked"]), 2)
+        self.assertEqual(
+            {item["qg_version"] for item in result["ready"]},
+            {"baseline-d", "baseline-e"},
+        )
+
+    def test_overlapping_groups_are_transitive_in_both_directions(self):
+        versions = ("baseline-a", "baseline-b", "baseline-c")
+        for changed in ("baseline-a", "baseline-c"):
+            with self.subTest(non_unaffected=changed):
+                self.baseline_workbooks(
+                    {"PA": (versions[0],), "PB": (versions[1],), "PC": (versions[2],)},
+                    {changed: {"最新状态": "待确认"}, "baseline-b": {"已走单": "是"}},
+                )
+                result = self.run_precheck(
+                    versions, shared_groups=((versions[0], versions[1]), (versions[1], versions[2])),
+                )
+                self.assert_shared_submission_blocked(result, f"{changed}=待确认")
+
+    def test_explicit_and_automatic_groups_are_merged(self):
+        versions = self.baseline_workbooks(
+            {"P5": ("baseline-a", "baseline-b"), "P6": ("baseline-c",)},
+            {"baseline-b": {"已走单": "是"}, "baseline-c": {"最新状态": "待确认"}},
+        )
+        result = self.run_precheck(versions, shared_groups=(("baseline-b", "baseline-c"),))
+        self.assert_shared_submission_blocked(result, "baseline-c=待确认")
+
+    def test_missing_pbild_does_not_link_unrelated_versions(self):
+        versions = self.baseline_workbooks({"": ("baseline-a", "baseline-b")})
+        with patch.dict(scope, {
+            "excel_list": [f"{version}.xlsx" for version in versions],
+            "SHARED_BASELINE_GROUPS": (),
+        }):
+            self.assertEqual(self.service._get_shared_baseline_groups(), ())
 
 
 if __name__ == "__main__":

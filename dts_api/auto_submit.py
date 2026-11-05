@@ -32,7 +32,8 @@ from test_system_third_party.welink import WeLinkMsg
 
 logger = logging.getLogger("django")
 HISTORY_COL = "dts_auto_submit_history"
-# 以下基线共用 DTS 单据，必须全部明确为无影响才能提交。
+# 自动按 excel_list 中各版本的 pbild 分组；这里可补充显式关联组。
+# 每组可含任意多个版本（不带 .xlsx），组内双向检查，重叠组会合并。
 SHARED_BASELINE_GROUPS = (
     ("aos5.0-master-1951", "aos5.0-master-1952"),
 )
@@ -313,14 +314,36 @@ class DtsAutoSubmitService:
                 logger.info("[走单去重] hwpsirt=%s pbild=%s versions=%s", item["hwpsirt_id"], item["pbild"], ",".join(versions))
         return list(groups.values())
 
-    @staticmethod
-    def _split_shared_baselines(items, baseline_statuses):
+    def _get_shared_baseline_groups(self):
+        """合并相同 pbild 和显式配置的关联关系，得到互相核对的版本组。"""
+        by_pbild = {}
+        for file_name in excel_list:
+            version = Path(file_name).stem
+            pbild = self.version_map.get(version, "")
+            if pbild:
+                by_pbild.setdefault(pbild, set()).add(version)
+
+        groups = [set(group) for group in SHARED_BASELINE_GROUPS]
+        groups.extend(versions for versions in by_pbild.values() if len(versions) > 1)
+        merged = []
+        for group in groups:
+            component, separate = set(group), []
+            for existing in merged:
+                if component.intersection(existing):
+                    component.update(existing)
+                else:
+                    separate.append(existing)
+            merged = separate + [component]
+        return tuple(tuple(sorted(group)) for group in merged if len(group) > 1)
+
+    def _split_shared_baselines(self, items, baseline_statuses):
         """共用 DTS 单据在每个基线都明确为无影响，才允许继续走单。"""
+        groups = self._get_shared_baseline_groups()
         pending, blocked = [], []
         for item in items:
             versions = {x["qg_version"] for x in item["targets"]}
             conflicts, missing, unread = {}, set(), set()
-            for group in SHARED_BASELINE_GROUPS:
+            for group in groups:
                 if not versions.intersection(group):
                     continue
                 for version in group:
